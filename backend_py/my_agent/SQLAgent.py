@@ -11,8 +11,7 @@ class SQLAgent:
     def parse_question(self, state: dict) -> dict:
         """Parse user question and identify relevant tables and columns."""
         question = state['question']
-        schema = self.db_manager.get_schema(state['uuid'])
-
+        schema = self.db_manager.get_schema()
         prompt = ChatPromptTemplate.from_messages([
             ("system", '''You are a data analyst that can help summarize SQL tables and parse user questions about a database. 
 Given the question and database schema, identify the relevant tables and columns. 
@@ -32,7 +31,7 @@ Your response should be in the following JSON format:
 
 The "noun_columns" field should contain only the columns that are relevant to the question and contain nouns or names, for example, the column "Artist name" contains nouns relevant to the question "What are the top selling artists?", but the column "Artist ID" is not relevant because it does not contain a noun. Do not include columns that contain numbers.
 '''),
-            ("human", "===Database schema:\n{schema}\n\n===User question:\n{question}\n\nIdentify relevant tables and columns:")
+            ("human", '''===Database schema:\n{schema}\n\n===User question:\n{question}\n\nIdentify relevant tables and columns:''')
         ])
 
         output_parser = JsonOutputParser()
@@ -41,6 +40,57 @@ The "noun_columns" field should contain only the columns that are relevant to th
         parsed_response = output_parser.parse(response)
         return {"parsed_question": parsed_response}
 
+    def generate_join_clause(self, state: dict) -> dict:
+        """Generate SQL join clause based on relevant tables"""
+        parsed_question = state['parsed_question']
+        if not parsed_question['is_relevant']:
+            return {"joined_table": ''}
+        
+        relevant_tables = [table['table_name'] for table in parsed_question['relevant_tables']]
+        if len(relevant_tables) != 2:
+            return {"joined_table": ''}
+        resp = self.db_manager.get_join_path(relevant_tables[0], relevant_tables[1])
+        # prompt = ChatPromptTemplate.from_messages([
+        #     ("system", '''
+        #     You are an AI assistant that generates SQL join clauses based on relevant tables. Generate a valid SQL join clause to join the relevant tables.
+
+        #     If there is not enough information to write a SQL join clause, respond with "NOT_ENOUGH_INFO".
+
+        #     Just give the join clause string. Do not format it. Make sure to use the correct spellings of table names as provided in the relevant tables list. All the table names should be enclosed in backticks.
+        #     '''),
+        #     ("human", '''
+        #     ===Relevant tables:
+        #     {relevant_tables}
+        #     Generate SQL join clause string''')
+        # ])
+        # response = self.llm_manager.invoke(prompt, knowledge_graph=knowledge_graph, relevant_tables=relevant_tables)
+        return {"joined_table": str(resp[0][0])}
+
+    def generate_knowledge_graph(self, state: dict) -> dict:
+        """Generate knowledge graph for database schema"""
+        schema = self.db_manager.get_schema()
+        prompt = ChatPromptTemplate.from_messages([("system",'''You are a database expert. Based on the provided database schema's foreign key, generate a knowledge graph that represents the relationships between tables.
+Make sure to include all relevant tables and their relationships.
+Your response should be in the following JSON format:
+{{
+    "entities": [string],
+    "relationships": [
+        {{
+            "src_table": string,
+            "src_column": string,
+            "tgt_table": string,
+            "tgt_column": string
+        }}
+    ]                                                    
+}}
+
+The "entities" include every table name, "relationships" include every two tables have foreign key connnected.   
+'''),("human",'''===Database schema:
+      {schema}
+    Generate knowledge graph JSON:''')
+        ])
+        response = self.llm_manager.invoke(prompt, schema=schema)
+        return {"knowledge_graph": response}
     def get_unique_nouns(self, state: dict) -> dict:
         """Find unique nouns in relevant tables and columns."""
         parsed_question = state['parsed_question']
@@ -55,8 +105,8 @@ The "noun_columns" field should contain only the columns that are relevant to th
             
             if noun_columns:
                 column_names = ', '.join(f"`{col}`" for col in noun_columns)
-                query = f"SELECT DISTINCT {column_names} FROM `{table_name}`"
-                results = self.db_manager.execute_query(state['uuid'], query)
+                query = f"SELECT DISTINCT {column_names} FROM `{table_name}` limit 3"
+                results = self.db_manager.execute_query(query)
                 for row in results:
                     unique_nouns.update(str(value) for value in row if value)
 
@@ -66,40 +116,21 @@ The "noun_columns" field should contain only the columns that are relevant to th
         """Generate SQL query based on parsed question and unique nouns."""
         question = state['question']
         parsed_question = state['parsed_question']
-        unique_nouns = state['unique_nouns']
+        # unique_nouns = state['unique_nouns']
 
         if not parsed_question['is_relevant']:
             return {"sql_query": "NOT_RELEVANT", "is_relevant": False}
     
-        schema = self.db_manager.get_schema(state['uuid'])
+        schema = self.db_manager.get_schema()
+        joined_table = state['joined_table']
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", '''
-You are an AI assistant that generates SQL queries based on user questions, database schema, and unique nouns found in the relevant tables. Generate a valid SQL query to answer the user's question.
+You are an AI assistant that generates SQL queries based on user questions, database schema. Generate a valid SQL query to answer the user's question.
 
+If joined tables are given, use the joined tables to generate the SQL query's join clause.
 If there is not enough information to write a SQL query, respond with "NOT_ENOUGH_INFO".
 
-Here are some examples:
-
-1. What is the top selling product?
-Answer: SELECT product_name, SUM(quantity) as total_quantity FROM sales WHERE product_name IS NOT NULL AND quantity IS NOT NULL AND product_name != "" AND quantity != "" AND product_name != "N/A" AND quantity != "N/A" GROUP BY product_name ORDER BY total_quantity DESC LIMIT 1
-
-2. What is the total revenue for each product?
-Answer: SELECT \`product name\`, SUM(quantity * price) as total_revenue FROM sales WHERE \`product name\` IS NOT NULL AND quantity IS NOT NULL AND price IS NOT NULL AND \`product name\` != "" AND quantity != "" AND price != "" AND \`product name\` != "N/A" AND quantity != "N/A" AND price != "N/A" GROUP BY \`product name\`  ORDER BY total_revenue DESC
-
-3. What is the market share of each product?
-Answer: SELECT \`product name\`, SUM(quantity) * 100.0 / (SELECT SUM(quantity) FROM sa  les) as market_share FROM sales WHERE \`product name\` IS NOT NULL AND quantity IS NOT NULL AND \`product name\` != "" AND quantity != "" AND \`product name\` != "N/A" AND quantity != "N/A" GROUP BY \`product name\`  ORDER BY market_share DESC
-
-4. Plot the distribution of income over time
-Answer: SELECT income, COUNT(*) as count FROM users WHERE income IS NOT NULL AND income != "" AND income != "N/A" GROUP BY income
-
-THE RESULTS SHOULD ONLY BE IN THE FOLLOWING FORMAT, SO MAKE SURE TO ONLY GIVE TWO OR THREE COLUMNS:
-[[x, y]]
-or 
-[[label, x, y]]
-             
-For questions like "plot a distribution of the fares for men and women", count the frequency of each fare and plot it. The x axis should be the fare and the y axis should be the count of people who paid that fare.
-SKIP ALL ROWS WHERE ANY COLUMN IS NULL or "N/A" or "".
 Just give the query string. Do not format it. Make sure to use the correct spellings of nouns as provided in the unique nouns list. All the table and column names should be enclosed in backticks.
 '''),
             ("human", '''===Database schema:
@@ -111,13 +142,13 @@ Just give the query string. Do not format it. Make sure to use the correct spell
 ===Relevant tables and columns:
 {parsed_question}
 
-===Unique nouns in relevant tables:
-{unique_nouns}
+===SQL joined tables:
+{joined_table}   
 
 Generate SQL query string'''),
         ])
 
-        response = self.llm_manager.invoke(prompt, schema=schema, question=question, parsed_question=parsed_question, unique_nouns=unique_nouns)
+        response = self.llm_manager.invoke(prompt, schema=schema, question=question, parsed_question=parsed_question, joined_table=joined_table)
         
         if response.strip() == "NOT_ENOUGH_INFO":
             return {"sql_query": "NOT_RELEVANT"}
@@ -131,7 +162,7 @@ Generate SQL query string'''),
         if sql_query == "NOT_RELEVANT":
             return {"sql_query": "NOT_RELEVANT", "sql_valid": False}
         
-        schema = self.db_manager.get_schema(state['uuid'])
+        schema = self.db_manager.get_schema()
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", '''
@@ -199,13 +230,12 @@ For example:
     def execute_sql(self, state: dict) -> dict:
         """Execute SQL query and return results."""
         query = state['sql_query']
-        uuid = state['uuid']
         
         if query == "NOT_RELEVANT":
             return {"results": "NOT_RELEVANT"}
 
         try:
-            results = self.db_manager.execute_query(uuid, query)
+            results = self.db_manager.execute_query(query)
             return {"results": results}
         except Exception as e:
             return {"error": str(e)}

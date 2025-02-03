@@ -4,8 +4,8 @@ import operator
 
 class InputState(TypedDict):
     question: str
-    uuid: str
     parsed_question: Dict[str, Any]
+    joined_table: str
     unique_nouns: List[str]
     sql_query: str
     results: List[Any]
@@ -14,6 +14,7 @@ class InputState(TypedDict):
 class OutputState(TypedDict):
     parsed_question: Dict[str, Any]
     unique_nouns: List[str]
+    joined_table: str
     sql_query: str
     sql_valid: bool
     sql_issues: str
